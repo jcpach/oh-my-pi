@@ -540,6 +540,33 @@ export const cfgFindEnabled = register({
 	},
 });
 
+export const cfgFindBackend = register({
+	id: "find.backend",
+	type: "enum",
+	values: ["lexical", "colgrep"] as const,
+	default: "colgrep",
+	ui: {
+		tab: "tools",
+		group: "Available Tools",
+		label: "Find backend",
+		description:
+			"Candidate selection for the find tool, before the judge verifies passages. Colgrep prioritizes files from the existing colgrep index and falls back to the lexical scan when colgrep is unavailable; Lexical always uses the native keyword scan and filename ranking.",
+		options: [
+			{
+				value: "lexical",
+				label: "Lexical",
+				description: "Native keyword scan and filename ranking; no colgrep index is consulted",
+			},
+			{
+				value: "colgrep",
+				label: "Colgrep",
+				description:
+					"Use the existing colgrep index to prioritize files; fall back to the lexical scan when unavailable",
+			},
+		],
+	},
+});
+
 // Optional tools
 
 export const cfgDebugEnabled = register({

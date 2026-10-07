@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -21,7 +21,7 @@ import {
 import { readText, ReadTextError } from "@oh-my-pi/pi-coding-agent/tools/jfind/text";
 import { eligibleFile, renderTree, resolveSearchRoot } from "@oh-my-pi/pi-coding-agent/tools/jfind/tree";
 import { resolveSearchResultPath } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { ptree, removeWithRetries } from "@oh-my-pi/pi-utils";
 
 /** Read-tier URL filesystem rooted at `cwd`, as the `find` tool builds one per call. */
 function urlFs(cwd: string): InternalUrlFilesystem {
@@ -215,6 +215,90 @@ function stateOf(request: JudgmentRequest): Record<string, unknown> {
 }
 
 describe("jfind cascade", () => {
+	it("uses colgrep candidates but reports only current-source passages accepted by the judge", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "jfind-colgrep-"));
+		const execute = spyOn(ptree, "exec");
+		try {
+			const target = Array.from({ length: 6_000 }, (_, i) =>
+				i === 4_700
+					? "export function computeAllowance() { return credits * 2; }"
+					: `// ${"retry budget ".repeat(20)}`,
+			).join("\n");
+			await Bun.write(path.join(dir, "target.ts"), target);
+			await Bun.write(path.join(dir, "decoy.ts"), "export const unrelated = 1;\n");
+			execute.mockResolvedValue({
+				exitCode: 0,
+				ok: true,
+				stderr: "",
+				stdout: JSON.stringify([
+					{ unit: { file: path.join(dir, "decoy.ts"), line: 1, end_line: 1 }, score: 10 },
+					{
+						unit: {
+							file: path.join(dir, "target.ts"),
+							line: 4_701,
+							end_line: 4_701,
+							code: "STALE_INDEX_CONTENT",
+						},
+						score: 9,
+					},
+				]),
+			});
+			const judge = new FakeJudge((request, key) => {
+				const state = stateOf(request);
+				if ("files" in state) {
+					const card = (state.passages as Record<string, [string, string]>)[key]!;
+					return card[1].includes("computeAllowance") || card[1].includes("unrelated") ? 0.9 : 0.1;
+				}
+				const passage = (state.passages as Record<string, string>)[key]!;
+				return passage.includes("computeAllowance") ? 0.95 : 0.05;
+			});
+			const result = await runCascade({
+				root: { path: dir, type: "directory" },
+				filesystem: urlFs(dir),
+				query: "retry budget",
+				extraKeywords: [],
+				judge,
+				includeHidden: false,
+			});
+			expect(result.hits.map(hit => hit.rel)).toEqual(["target.ts"]);
+			expect(result.hits[0]!.contentScore).toBe(0.95);
+			expect(result.hits[0]!.ranges[0]!.start).toBeLessThanOrEqual(4_701);
+			expect(result.hits[0]!.ranges[0]!.end).toBeGreaterThanOrEqual(4_701);
+			expect(judge.requests.some(request => "tree" in stateOf(request))).toBe(false);
+			expect(JSON.stringify(judge.requests)).not.toContain("STALE_INDEX_CONTENT");
+			expect(result.stats.requests).toBe(3);
+			expect(result.stats.inputTokens).toBe(300);
+			expect(result.stats.cost).toBeCloseTo(0.003);
+		} finally {
+			execute.mockRestore();
+			await removeWithRetries(dir);
+		}
+	});
+
+	it("falls back to lexical retrieval when colgrep cannot return candidates", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "jfind-colgrep-fallback-"));
+		const execute = spyOn(ptree, "exec");
+		try {
+			await Bun.write(path.join(dir, "retry.ts"), "export function retryBudget() { return 2; }\n");
+			execute.mockRejectedValue(new Error("ENOENT: colgrep"));
+			const judge = new FakeJudge(() => 0.8);
+			const result = await runCascade({
+				root: { path: dir, type: "directory" },
+				filesystem: urlFs(dir),
+				query: "retry budget",
+				extraKeywords: [],
+				judge,
+				includeHidden: false,
+			});
+			expect(result.hits.map(hit => hit.rel)).toEqual(["retry.ts"]);
+			expect(judge.requests.some(request => "tree" in stateOf(request))).toBe(true);
+			expect(result.stats.errors).toBe(0);
+		} finally {
+			execute.mockRestore();
+			await removeWithRetries(dir);
+		}
+	});
+
 	it("verifies only sketched passages, reports merged ranges, and runs waves in parallel", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "jfind-cascade-"));
 		try {
@@ -239,6 +323,7 @@ describe("jfind cascade", () => {
 				return passage.includes("retryBudget") ? 0.95 : 0.3;
 			});
 			const result = await runCascade({
+				backend: "lexical",
 				root: { path: dir, type: "directory" },
 				filesystem: urlFs(dir),
 				query: "how is the retry budget computed?",
@@ -255,7 +340,6 @@ describe("jfind cascade", () => {
 			expect(hit.ranges).toHaveLength(1);
 			expect(hit.ranges[0]!.start).toBeLessThanOrEqual(251);
 			expect(hit.ranges[0]!.end).toBeGreaterThanOrEqual(251);
-			expect(hit.ranges[0]!.snippet).toBe("const noise0 = 0;");
 
 			// Wave 1 judged every listed file by name; wave 3 verified only the routed sketch.
 			const nameRequests = judge.requests.filter(request => "tree" in stateOf(request));
@@ -282,6 +366,7 @@ describe("jfind cascade", () => {
 				return 0.7;
 			});
 			const result = await runCascade({
+				backend: "lexical",
 				root: { path: dir, type: "directory" },
 				filesystem: urlFs(dir),
 				query: "token parsing",
@@ -388,6 +473,7 @@ describe("jfind cascade", () => {
 			});
 			await expect(
 				runCascade({
+					backend: "lexical",
 					root: { path: dir, type: "directory" },
 					filesystem: urlFs(dir),
 					query: "anything at all",

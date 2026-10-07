@@ -1,22 +1,22 @@
 /**
  * Cascade search: semantic passage maps before full-source reading.
  *
- * 1. Lexical scan ranks every eligible file by query keywords.
- * 2. Filename ranking judges the top candidates by name and place in the tree.
- * 3. Passage scoring reads the strongest files, cuts them into byte-bounded
+ * 1. Colgrep ranks eligible files and code units, or lexical scanning and
+ *    filename judgments provide the fallback shortlist.
+ * 2. Passage scoring reads the strongest files, cuts them into byte-bounded
  *    windows, and judges a budgeted verbatim sketch of each window.
- * 4. Verification judges the complete text of the sketches that survived.
+ * 3. Verification judges the complete text of the sketches that survived.
  *
  * Sketch judgments are only routing signals: a reported heat range always
  * comes from a complete passage. Each judged phase runs its requests through
- * a bounded-parallel dispatcher and drains fully before the next begins, so
- * the critical path is three dependent waves.
+ * a bounded-parallel dispatcher and drains fully before the next begins.
  */
 import * as path from "node:path";
 import type { Judge, JudgmentResult, NoulQuestion } from "@oh-my-pi/pi-ai";
 import type { FindHit, FindStats } from "@oh-my-pi/pi-tui/tools/find";
-import type { InternalUrlFilesystem } from "../../internal-urls/url-filesystem";
+import { type InternalUrlFilesystem, isUrlPath } from "../../internal-urls/url-filesystem";
 import { throwIfAborted } from "../tool-errors";
+import { type ColgrepCandidate, colgrepCandidates } from "./colgrep";
 import { fileScore, grepIndex, idf } from "./lexical";
 import { keywords as deriveKeywords } from "./keywords";
 import { type HeatRange, mergeHeat, type Passage, plainContent, selectWindows, sketch, windows } from "./passages";
@@ -66,6 +66,7 @@ export interface CascadeOptions {
 	extraKeywords: readonly string[];
 	judge: Judge;
 	includeHidden: boolean;
+	backend?: "lexical" | "colgrep";
 	signal?: AbortSignal;
 	onProgress?: (message: string) => void;
 }
@@ -83,6 +84,8 @@ interface FilePlan {
 	total: number;
 	truncated: boolean;
 	passages: Passage[];
+	/** This file's colgrep code-unit ranges, strongest first; absent under the lexical backend. */
+	ranges?: readonly ColgrepCandidate[];
 }
 
 type Answers = JudgmentResult<Record<string, NoulQuestion>>;
@@ -174,61 +177,80 @@ class Cascade {
 		const { root, filesystem, query, includeHidden, signal, onProgress } = this.#options;
 		const keywords = deriveKeywords(query, this.#options.extraKeywords);
 
-		onProgress?.("lexical scan");
+		const useColgrep = this.#options.backend !== "lexical" && !isUrlPath(root.path);
+		onProgress?.(useColgrep ? "colgrep candidates" : "lexical scan");
 		const native = filesystem.shellFilesystem();
-		const [entries, index] = await Promise.all([
+		const [entries, lexicalIndex] = await Promise.all([
 			listFiles(root, { includeHidden, filesystem: native, signal }),
-			grepIndex(root.path, keywords, { includeHidden, filesystem: native, signal, timeoutMs: SCAN_TIMEOUT_MS }),
+			useColgrep
+				? undefined
+				: grepIndex(root.path, keywords, { includeHidden, filesystem: native, signal, timeoutMs: SCAN_TIMEOUT_MS }),
 		]);
 		this.stats.listed = entries.length;
-		const weights = idf(index);
-		const noCounts = Array.from({ length: keywords.length }, () => 0);
-		const ranked = entries
-			.map((entry, node) => ({
-				node,
-				lex: fileScore(index.perFileKw.get(entry.rel) ?? noCounts, weights, entry.rel, keywords),
-			}))
-			.sort((a, b) => b.lex - a.lex || compareRel(entries[a.node]!, entries[b.node]!))
-			.slice(0, CANDIDATES);
+		const semantic = useColgrep
+			? await colgrepCandidates({ root, entries, query, limit: CANDIDATES, signal })
+			: undefined;
 		const nameScore = Array.from<number | undefined>({ length: entries.length });
+		let weights = keywords.map(() => 1);
+		let selected: number[];
+		if (semantic != null) {
+			selected = [...new Set(semantic.map(candidate => candidate.node))].slice(0, FILES);
+		} else {
+			if (useColgrep) onProgress?.("lexical scan");
+			const index =
+				lexicalIndex ??
+				(await grepIndex(root.path, keywords, {
+					includeHidden,
+					filesystem: native,
+					signal,
+					timeoutMs: SCAN_TIMEOUT_MS,
+				}));
+			weights = idf(index);
+			const noCounts = Array.from({ length: keywords.length }, () => 0);
+			const ranked = entries
+				.map((entry, node) => ({
+					node,
+					lex: fileScore(index.perFileKw.get(entry.rel) ?? noCounts, weights, entry.rel, keywords),
+				}))
+				.sort((a, b) => b.lex - a.lex || compareRel(entries[a.node]!, entries[b.node]!))
+				.slice(0, CANDIDATES);
 
-		// Wave 1: filename ranking over the lexical shortlist.
-		const project = path.basename(root.path);
-		const nameJobs = chunks(
-			ranked.map(candidate => candidate.node),
-			NAME_BATCH,
-		).map(batch => ({
-			batch,
-			request: nameBatch(
-				project,
-				query,
-				batch.map(node => entries[node]!),
-			),
-		}));
-		let named = 0;
-		onProgress?.(`filename ranking 0/${ranked.length}`);
-		await this.#dispatch(nameJobs, (job, outcome) => {
-			named += job.batch.length;
-			if (!outcome.ok) this.#fail("filenames", outcome.error);
-			job.batch.forEach((node, k) => {
-				const p = noul(outcome, entryKey(k));
-				nameScore[node] = p;
-				if (p === undefined) {
-					if (outcome.ok) this.stats.errors++;
-				} else {
-					this.stats.judged++;
-				}
+			const project = path.basename(root.path);
+			const nameJobs = chunks(
+				ranked.map(candidate => candidate.node),
+				NAME_BATCH,
+			).map(batch => ({
+				batch,
+				request: nameBatch(
+					project,
+					query,
+					batch.map(node => entries[node]!),
+				),
+			}));
+			let named = 0;
+			onProgress?.(`filename ranking 0/${ranked.length}`);
+			await this.#dispatch(nameJobs, (job, outcome) => {
+				named += job.batch.length;
+				if (!outcome.ok) this.#fail("filenames", outcome.error);
+				job.batch.forEach((node, k) => {
+					const p = noul(outcome, entryKey(k));
+					nameScore[node] = p;
+					if (p === undefined) {
+						if (outcome.ok) this.stats.errors++;
+					} else {
+						this.stats.judged++;
+					}
+				});
+				onProgress?.(`filename ranking ${named}/${ranked.length}`);
 			});
-			onProgress?.(`filename ranking ${named}/${ranked.length}`);
-		});
 
-		// The two strongest lexical candidates are read regardless of the name
-		// judgment; the rest of the budget follows name score, then lexical rank.
-		const selected = ranked.slice(0, Math.min(FILES, 2)).map(candidate => candidate.node);
-		ranked.sort((a, b) => (nameScore[b.node] ?? 0) - (nameScore[a.node] ?? 0) || b.lex - a.lex);
-		for (const candidate of ranked) {
-			if (selected.length >= FILES) break;
-			if (!selected.includes(candidate.node)) selected.push(candidate.node);
+			// Two lexical candidates bypass filename judgments so naming alone cannot hide them.
+			selected = ranked.slice(0, Math.min(FILES, 2)).map(candidate => candidate.node);
+			ranked.sort((a, b) => (nameScore[b.node] ?? 0) - (nameScore[a.node] ?? 0) || b.lex - a.lex);
+			for (const candidate of ranked) {
+				if (selected.length >= FILES) break;
+				if (!selected.includes(candidate.node)) selected.push(candidate.node);
+			}
 		}
 		onProgress?.(`reading ${selected.length} files`);
 		const plans = await Promise.all(
@@ -236,9 +258,17 @@ class Cascade {
 				const entry = entries[node]!;
 				try {
 					const read = await readText(filesystem, entry.path, READ_LIMIT);
-					const passages = selectWindows(windows(read.text, WINDOW_BYTES, keywords, weights), WINDOWS);
+					const fileWindows = windows(read.text, WINDOW_BYTES, keywords, weights);
+					const ranges = semantic?.filter(candidate => candidate.node === node);
+					if (ranges != null) {
+						for (const passage of fileWindows) {
+							const rank = ranges.findIndex(range => range.start <= passage.end && range.end >= passage.start);
+							passage.score = rank < 0 ? 0 : 1 / (rank + 1);
+						}
+					}
+					const passages = selectWindows(fileWindows, WINDOWS);
 					if (passages.length === 0) return undefined;
-					return { node, total: lines(read.text).length, truncated: read.truncated, passages };
+					return { node, total: lines(read.text).length, truncated: read.truncated, passages, ranges };
 				} catch (error) {
 					// Binary and blank files are expected misses, not failures worth reporting.
 					if (!(error instanceof ReadTextError) || error.kind === "io") this.#fail(`read ${entry.rel}`, error);
@@ -257,9 +287,28 @@ class Cascade {
 			Math.min(SKETCH_CARDS_MAX, Math.max(1, Math.floor(SKETCH_STATE_BYTES / SKETCH_BYTES))),
 		).map(batch => {
 			const sketches: SketchCard[] = batch.map(({ f, p }) => {
-				const text = sketch(files[f]!.passages[p]!, keywords, weights, SKETCH_BYTES);
+				const plan = files[f]!;
+				const passage = plan.passages[p]!;
+				// Sketch only the best overlapping colgrep code unit so keyword-dense
+				// neighbors cannot crowd the matched code out of the keyword-ranked card.
+				const range = plan.ranges?.find(
+					candidate => candidate.start <= passage.end && candidate.end >= passage.start,
+				);
+				let card = passage;
+				if (range != null) {
+					const start = Math.max(passage.start, range.start);
+					const end = Math.min(passage.end, range.end);
+					const tagged = lines(passage.text);
+					card = {
+						start,
+						end,
+						text: `${tagged.slice(start - passage.start, end - passage.start + 1).join("\n")}\n`,
+						score: passage.score,
+					};
+				}
+				const text = sketch(card, keywords, weights, SKETCH_BYTES);
 				sketchSentBytes += Buffer.byteLength(text);
-				return { fileKey: `f${f}`, rel: entries[files[f]!.node]!.rel, sketch: text };
+				return { fileKey: `f${f}`, rel: entries[plan.node]!.rel, sketch: text };
 			});
 			return { batch, request: sketchBatch(query, sketches) };
 		});

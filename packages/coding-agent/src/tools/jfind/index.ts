@@ -21,7 +21,7 @@ import { type CascadeResult, runCascade } from "./cascade";
 import { rankedHeat } from "./passages";
 import { resolveSearchRoot } from "./tree";
 
-import { cfgFindEnabled } from "../settings";
+import { cfgFindBackend, cfgFindEnabled } from "../settings";
 
 const findSchema = type({
 	query: "string",
@@ -103,6 +103,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 				filesystem,
 				query,
 				extraKeywords: params.grep_keywords,
+				backend: cfgFindBackend.get(this.session.settings),
 				judge,
 				includeHidden: false,
 				signal: signal ? AbortSignal.any([signal, timeout]) : timeout,

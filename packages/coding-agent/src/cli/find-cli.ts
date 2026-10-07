@@ -5,12 +5,14 @@
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { formatBytes, formatDuration, formatNumber } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
+import { Settings } from "../config/settings";
 import { InternalUrlFilesystem, isUrlPath } from "../internal-urls/url-filesystem";
 import { openStandaloneJudge } from "../judgment/standalone";
 import { formatPathRelativeToCwd, resolveSearchResultPath } from "../tools/path-utils";
 import { type CascadeResult, runCascade } from "../tools/jfind/cascade";
 import { rankedHeat } from "../tools/jfind/passages";
 import { resolveSearchRoot, type SearchRoot } from "../tools/jfind/tree";
+import { cfgFindBackend } from "../tools/settings";
 
 export interface FindCommandArgs {
 	query: string;
@@ -91,6 +93,11 @@ export async function runFindCommand(cmd: FindCommandArgs): Promise<void> {
 	// Settings and extensions belong to the searched project; a file or URL
 	// scope has none of its own, so it keeps the caller's.
 	const baseCwd = root.type === "directory" && !isUrlPath(root.path) ? root.path : cwd;
+	// Same effective project setting as the judge: `Settings.init` is the process
+	// singleton `openStandaloneJudge` also loads, so this reads the searched
+	// project's `find.backend` without a second load.
+	const settings = await Settings.init({ cwd: baseCwd });
+	const backend = cfgFindBackend.get(settings);
 	log("resolving judge");
 	const { judge, close } = await openStandaloneJudge(baseCwd, "find");
 	try {
@@ -100,6 +107,7 @@ export async function runFindCommand(cmd: FindCommandArgs): Promise<void> {
 			filesystem,
 			query: cmd.query.trim(),
 			extraKeywords: cmd.keywords,
+			backend,
 			judge,
 			includeHidden: cmd.hidden,
 			onProgress: log,

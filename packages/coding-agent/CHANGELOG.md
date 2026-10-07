@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `find.backend` setting to choose how the `find` tool selects candidate files before judge verification. The default, `colgrep`, queries an existing colgrep index for code-unit ranges that prioritize which files and windows are sketched, skipping the native lexical scan and filename ranking, and falls back to them whenever colgrep is unavailable (no index, timeout, failed call, or a URL scope). `lexical` keeps the previous keyword-scan and filename-ranking path. Snippets, scores, and hits still come from live file content judged by the judge role, so a stale index can only affect prioritization.
+
 ## [18.6.1] - 2026-10-04
 
 ### Fixed

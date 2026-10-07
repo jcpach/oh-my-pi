@@ -151,6 +151,11 @@ export class TimeoutError extends AbortError {
 export interface WaitOptions {
 	allowNonZero?: boolean;
 	allowAbort?: boolean;
+	/**
+	 * Maximum stdout bytes to capture before terminating the process tree with
+	 * an {@link AbortError}. Unlimited when omitted, preserving complete capture.
+	 */
+	maxStdoutBytes?: number;
 	/** `full` requires upfront capture; `exec` enables it, while direct `spawn` callers pass `stderr: "full"`. */
 	stderr?: "full" | "buffer";
 }
@@ -435,13 +440,15 @@ export class ChildProcess<In extends InMask = InMask> {
 	}
 
 	/**
-	 * Read a pipe fully, stopping early only at an explicit command deadline.
+	 * Read a pipe fully, stopping early at an explicit command deadline or once
+	 * `maxBytes` of stdout has been captured (which terminates the tree).
 	 */
-	async #readStream(stream: ReadableStream<Uint8Array>): Promise<string> {
+	async #readStream(stream: ReadableStream<Uint8Array>, maxBytes?: number): Promise<string> {
 		this.#openPipeReaders++;
 		const reader = stream.getReader();
 		const dec = new TextDecoder();
 		let out = "";
+		let captured = 0;
 		try {
 			for (;;) {
 				const chunk = await Promise.race([
@@ -453,6 +460,16 @@ export class ChildProcess<In extends InMask = InMask> {
 					break;
 				}
 				if (chunk.r.done) break;
+				if (maxBytes !== undefined && captured + chunk.r.value.byteLength > maxBytes) {
+					const remaining = maxBytes - captured;
+					if (remaining > 0) out += dec.decode(chunk.r.value.subarray(0, remaining), { stream: true });
+					// Terminate the tree first; wait() then observes the pending
+					// AbortError so `allowAbort` governs the reported outcome.
+					this.kill(new AbortError(new Error(`stdout exceeded ${maxBytes} bytes`), this.#stderrTail), -1);
+					await reader.cancel().catch(() => {});
+					break;
+				}
+				captured += chunk.r.value.byteLength;
 				out += dec.decode(chunk.r.value, { stream: true });
 			}
 		} catch {
@@ -524,13 +541,13 @@ export class ChildProcess<In extends InMask = InMask> {
 	// ── Wait ─────────────────────────────────────────────────────────────
 
 	async wait(opts?: WaitOptions): Promise<ExecResult> {
-		const { allowNonZero = false, allowAbort = false, stderr: stderrMode = "buffer" } = opts ?? {};
+		const { allowNonZero = false, allowAbort = false, maxStdoutBytes, stderr: stderrMode = "buffer" } = opts ?? {};
 		const stderrChunks = this.#stderrChunks;
 		if (stderrMode === "full" && !stderrChunks) {
 			throw new Error('Full stderr capture must be requested when spawning the process (pass stderr: "full")');
 		}
 
-		const stdoutP = this.#readStream(this.proc.stdout);
+		const stdoutP = this.#readStream(this.proc.stdout, maxStdoutBytes);
 		const stderrP =
 			stderrMode === "full" && stderrChunks
 				? this.#stderrDone.then(() => new TextDecoder().decode(Buffer.concat(stderrChunks)))
@@ -671,11 +688,11 @@ export interface ExecOptions extends Omit<ChildSpawnOptions, "stderr" | "stdin">
 
 /** Spawn, wait, and return captured output. */
 export async function exec(cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
-	const { input, stderr, allowAbort, allowNonZero, ...spawnOpts } = opts ?? {};
+	const { input, stderr, allowAbort, allowNonZero, maxStdoutBytes, ...spawnOpts } = opts ?? {};
 	const stdin = typeof input === "string" ? Buffer.from(input) : input;
 	const resolved: ChildSpawnOptions = stdin === undefined ? spawnOpts : { ...spawnOpts, stdin };
 	using child = spawnInternal(cmd, resolved, stderr === "full");
-	return await child.wait({ stderr, allowAbort, allowNonZero });
+	return await child.wait({ stderr, allowAbort, allowNonZero, maxStdoutBytes });
 }
 
 // ── Signal combinators ───────────────────────────────────────────────────────
